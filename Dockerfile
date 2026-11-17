@@ -13,12 +13,13 @@ RUN apt-get update && \
 # Set working directory
 WORKDIR /app
 
-# Copy requirements and install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy requirements and install dependencies (dev = pytest, so the tests can run in the container)
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
 
-# Copy application files
-COPY bot.py lastfm.py musicbrainz.py ./
+# Copy application files and tests
+COPY *.py pytest.ini ./
+COPY tests ./tests
 
 # Run the bot
 CMD ["python", "-u", "bot.py"]

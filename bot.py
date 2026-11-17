@@ -1,86 +1,53 @@
+import asyncio
+import os
+import random
+
 import discord
 from discord.ext import commands
-import os
 from dotenv import load_dotenv
-import asyncio
-import random
-import yt_dlp
-import musicbrainz
+
 import lastfm
+import metadata
+import youtube
+from models import Song
+from player import AUTOPLAY, GuildPlayer, Services
 
-
-### DEFINITIONS ###
-# SONG DATA
-class Song:
-    def __init__(self, title, url, audio_url, duration, track=None, artist=None, requester=None, source="youtube"):
-        self.title = title # Youtube video title NOT the song title
-        self.track = track
-        self.artist = artist
-        self.url = url
-        self.audio_url = audio_url
-        self.duration = duration
-        self.requester = requester # May want to change this later but will just manually set in the discord command to separate logic
-        self.source = source
-    
-    @classmethod
-    def from_youtube(cls, info, song_name = None, artist_name = None):
-        return cls(
-            title=info['title'],
-            track = song_name,
-            artist = artist_name,
-            url=info['webpage_url'],
-            audio_url=info['url'],
-            duration=info['duration'],
-            # May want to change this later but will just manually set in the discord command to separate logic
-            #requester=requester,
-            source="youtube"
-        )
-    
-    @classmethod
-    # UNUSED
-    def from_local_file(cls, filepath, metadata, requester):
-        return cls(
-            title=metadata['title'],
-            url=filepath,
-            audio_url=filepath,
-            duration=metadata['duration'],
-            requester=requester,
-            source="local"
-        )
-    
-    def __str__(self):
-        return f"{self.title} ({self.source})"
-
-# SERVER SPECIFIC DATA STRUCTURES
-currently_playing = {}  # Current song
-music_queues = {}  # Manually played queue
-autoplay_queues = {}  # Autoplay queue - only loads 2 songs at a time
-autoplay_enabled = {}  # Autoplay status
-autoplay_recommendations = {}  # Autoplay recs - full list for autoplay queue to pull from
-
-
-# YT_DLP
-ydl_opts = {
-    'format': 'bestaudio/best',
-    'quiet': True,
-    'default_search': 'ytsearch3',
-    'extract_flat': False,
-    'no_warnings': True,
-}
-
-### BOT ###
-# LOAD TOKEN FROM .ENV
+### SETUP ###
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 
-# CREATE BOT AND CLIENTS
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 
 bot = commands.Bot(command_prefix='/', intents=intents, help_command=None)
-mb_client = musicbrainz.MBClient()
-lastfm_client = lastfm.LastFMClient()
+
+QUEUE_DISPLAY_LIMIT = 15   # Discord embeds cap out at 4096 characters
+PLAYLIST_SEED_SCAN = 8     # playlist entries checked when looking for autoplay seeds
+MAX_SEEDS = 3              # tracks used to seed autoplay for albums/playlists
+
+
+def make_audio_source(song):
+    return discord.FFmpegPCMAudio(
+        song.stream_url,
+        before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+        options='-vn -af "loudnorm=I=-16:TP=-1.5:LRA=11"'
+    )
+
+
+# CLIENTS - tests replace the attributes on `services` with fakes
+http = metadata.Http()
+services = Services(
+    youtube=youtube.YouTube(),
+    identifier=metadata.Identifier([metadata.Deezer(http), metadata.ITunes(http),
+                                   metadata.MusicBrainz(http)]),
+    lastfm=lastfm.LastFMClient(http),
+    make_source=make_audio_source,
+)
+
+# SERVER SPECIFIC STATE
+players = {}
+
 
 ### METHODS ###
 def in_voice_channel():
@@ -92,182 +59,64 @@ def in_voice_channel():
     return commands.check(predicate)
 
 
-def get_queue(guild_id):
-    if guild_id not in music_queues:
-        music_queues[guild_id] = []
-    return music_queues[guild_id]
+def get_player(ctx):
+    player = players.get(ctx.guild.id)
+    if not player:
+        player = players[ctx.guild.id] = GuildPlayer(ctx.guild.id, services, on_player_event)
+    player.voice = ctx.voice_client
+    player.channel = ctx.channel
+    return player
 
 
-def get_autoplay_queue(guild_id):
-    if guild_id not in autoplay_queues:
-        autoplay_queues[guild_id] = []
-    return autoplay_queues[guild_id]
+async def on_player_event(player, kind, song=None, title=None, text=None):
+    """Messages the player sends on its own (not in reply to a command)."""
+    if not player.channel:
+        return
+    if kind == "autoplay":
+        await player.channel.send(embed=create_song_embed(player, song))
+    elif kind == "error":
+        await player.channel.send(embed=create_embed(title, text, discord.Color.red()))
 
 
-def get_autoplay_recommendations(guild_id):
-    if guild_id not in autoplay_recommendations:
-        autoplay_recommendations[guild_id] = []
-    return autoplay_recommendations[guild_id]
+async def connect_to_voice(ctx):
+    voice_channel = ctx.author.voice.channel
+    if not ctx.voice_client:
+        await voice_channel.connect(self_deaf=True)
+    elif ctx.voice_client.channel != voice_channel:
+        await ctx.voice_client.move_to(voice_channel)
 
-
-def is_autoplay_enabled(guild_id):
+    # GUARD: Connection may have failed after retries (e.g. DAVE protocol rejection)
+    if not ctx.voice_client:
+        await ctx.send(embed=create_embed("Error", "Failed to connect to voice channel.", discord.Color.red()))
+        return False
     return True
 
 
-async def fetch_autoplay_recommendations(ctx, mbid, artist, track):
-    if not mbid:
-        return False
-    
-    # GET RECOMMENDATIONS FROM LAST FM
-    recommendations = lastfm_client.get_recommendations(mbid, artist, track, 25)
-    
-    if not recommendations:
-        return False
-    
-    random.shuffle(recommendations)
-    
-    # STORE RECOMMENDATIONS
-    rec_list = get_autoplay_recommendations(ctx.guild.id)
-    rec_list.clear()
-    rec_list.extend(recommendations)
-    
-    print(f"Fetched {len(recommendations)} recommendations from Last.fm")
-    return True
+def fmt_duration(seconds):
+    if not seconds:
+        return "?:??"
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+    return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-async def load_next_autoplay_song(ctx):
-    rec_list = get_autoplay_recommendations(ctx.guild.id)
-    autoplay_queue = get_autoplay_queue(ctx.guild.id)
-    
-    if not rec_list:
-        print("No autoplay recommendations available")
-        return None
-    
-    rec = rec_list.pop(0)
-    rec_search = f"{rec['artist']} {rec['title']}"
-
-    # QUERY YOUTUBE FOR REC AND ADD TO AUTOPLAY QUEUE
-    yt_results = await query_youtube(rec_search, rec['title'], rec['artist'])
-    if yt_results:
-        song = yt_results[0]
-        song.requester = "Autoplay"
-        autoplay_queue.append(song)
-
-    # RETRY WITH NEXT SONG IF NOT FOUND
-    else:
-        await load_next_autoplay_song(ctx)
+def song_link(song):
+    # Album/autoplay tracks have no YouTube link until just before they play
+    return f"[{song.title}]({song.url})" if song.url else song.title
 
 
-async def query_youtube(search_query, song_name = None, artist_name = None):
-    # TODO CLEAN UP THE ARGUMENTS FOR THIS - THROWING THESE IN HERE TO ALLOW SONG - ARTIST DATA ON AUTOPLAY SONGS
-    try:
-        # YOUTUBE SEARCH
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            yt_info = await asyncio.to_thread(ydl.extract_info, search_query, False)
-
-            # DIRECT VIDEO LINK
-            if not 'entries' in yt_info:
-                song = Song.from_youtube(yt_info)
-                return [song]
-
-            # PLAYLIST
-            if len(yt_info['entries']) > 3: # Not the best logic but I imagine any playlists linked will have more than 3 songs, ytsearch3 returns 3 entries always
-                
-                # RETRIVE ALL SONG DATA
-                playlist = []
-                for entry in yt_info['entries']:
-                    if entry:
-                        song = Song.from_youtube(entry)
-                        playlist.append(song)
-                
-                return playlist
-
-            # SINGLE VIDEO
-            elif not ('youtube.com' in search_query or 'youtu.be' in search_query):
-                # FILTER OUT MUSIC VIDEOS
-                filtered_entries = [
-                    entry for entry in yt_info['entries']
-                    if entry 
-                    and '(clean)' not in entry.get('title', '').lower()
-                    and 'clean version' not in entry.get('title', '').lower()
-                    and 'album' not in entry.get('title', '').lower()
-                    and (
-                        # Allow if it contains "lyrics" or "lyric"
-                        'lyric' in entry.get('title', '').lower()
-                        or (
-                            # Otherwise, exclude these patterns
-                            'music video' not in entry.get('title', '').lower()
-                            and 'official video' not in entry.get('title', '').lower()
-                            and not ('official' in entry.get('title', '').lower() and 'video' in entry.get('title', '').lower())
-                        )
-                    )
-                ]
-                best_entry = filtered_entries[0] if filtered_entries else yt_info['entries'][0]
-                song = Song.from_youtube(best_entry, song_name, artist_name)
-                return [song]
-    except Exception as e:
-        print(f"Error querying YouTube: {e}")
-        return None
-
-
-async def play_song(ctx, song, from_autoplay=False):
-    voice_client = ctx.voice_client
-    audio_source = discord.FFmpegPCMAudio(
-        song.audio_url,
-        before_options='-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-        options='-vn -af "loudnorm=I=-16:TP=-1.5:LRA=11"'
-    )
-    
-    # CALLBACK - TRIGGERS AFTER PLAY_SONG FINISHES
-    def after_playing(error):
-        if error:
-            print(f"[after_playing] Playback error: {error}")  # at least log it
-            asyncio.run_coroutine_threadsafe(
-                ctx.send(embed=create_embed("Playback Error", str(error), discord.Color.red())),
-                bot.loop
-            )
-        
-        queue = get_queue(ctx.guild.id)
-        
-        # PLAY NEXT SONG IN MANUAL QUEUE
-        if queue:
-            next_song = queue.pop(0)
-            asyncio.run_coroutine_threadsafe(
-                play_song(ctx, next_song), 
-                bot.loop
-            )
-
-        # PLAY NEXT SONG IN AUTOPLAY QUEUE
-        elif is_autoplay_enabled(ctx.guild.id):
-            autoplay_queue = get_autoplay_queue(ctx.guild.id)
-            if autoplay_queue:
-                next_song = autoplay_queue.pop(0)
-                
-                # PLAY SONG
-                asyncio.run_coroutine_threadsafe(
-                    play_song(ctx, next_song), 
-                    bot.loop
-                )
-
-                # SEND EMBED
-                asyncio.run_coroutine_threadsafe(
-                    ctx.send(embed=create_song_embed(ctx, next_song)),
-                    bot.loop
-                )
-
-                # REPLENISH AUTOPLAY QUEUE
-                if len(autoplay_queue) < 2:
-                    asyncio.run_coroutine_threadsafe(
-                        load_next_autoplay_song(ctx),
-                        bot.loop
-                    )
-            else:
-                currently_playing[ctx.guild.id] = None
-        else:
-            currently_playing[ctx.guild.id] = None
-    
-    voice_client.play(audio_source, after=after_playing)
-    currently_playing[ctx.guild.id] = song
+async def find_playlist_seeds(entries, songs):
+    """Identify a few real songs in a YouTube playlist to seed autoplay from."""
+    seeds = []
+    for entry, song in list(zip(entries, songs))[:PLAYLIST_SEED_SCAN]:
+        meta = await services.identifier.identify_video(entry)
+        if meta:
+            song.meta = meta
+            seeds.append(meta)
+            if len(seeds) >= MAX_SEEDS:
+                break
+    return seeds
 
 
 ### MESSAGE EMBEDS
@@ -282,71 +131,74 @@ def create_embed(title, description=None, color=discord.Color.blue(), footer=Non
     return embed
 
 
-def create_song_embed(ctx, song, mb_results=None):
-    
-    queue = get_queue(ctx.guild.id)
-    autoplay_enabled = is_autoplay_enabled(ctx.guild.id)
-    from_autoplay = True if song.requester == "Autoplay" else False # Separating this out cause I may change how I determine
+def add_queue_position_fields(embed, player, song):
+    if song not in player.queue:
+        return
+    position = player.queue.index(song) + 1
+    embed.add_field(name="Position in Queue", value=f"#{position}", inline=True)
+
+    # TIME UNTIL PLAY
+    time_until = sum(s.duration or 0 for s in player.queue[:position - 1])
+    if player.current:
+        time_until += player.current.duration or 0
+    embed.add_field(name="Estimated Start", value=fmt_duration(time_until), inline=True)
+
+
+def create_song_embed(player, song, meta=None, show_autoplay_status=False):
+    from_autoplay = song.requester == AUTOPLAY
 
     embed = discord.Embed(
         title='Track Queued' if not from_autoplay else "Autoplaying Next Song",
-        description=f'[{song.title}]({song.url})',
+        description=song_link(song),
         color=discord.Color.green(),
         timestamp=discord.utils.utcnow()
     )
-    # MUSICBRAINZ MATCH / AUTOPLAY TRACK INFO
-    if mb_results:
-        embed.add_field(name="Identified As", value=f"`{mb_results['artist']} - {mb_results['track']}`", inline=False)
-    elif from_autoplay and song.track and song.artist:
-        embed.add_field(name="Track Info", value=f"`{song.artist} - {song.track}`", inline=False)
+    # IDENTIFIED TRACK / AUTOPLAY TRACK INFO
+    if from_autoplay and song.meta:
+        embed.add_field(name="Track Info", value=f"`{song.meta}`", inline=False)
+    elif meta:
+        embed.add_field(name="Identified As", value=f"`{meta}`", inline=False)
 
-    # DURATION
-    duration_str = f"{song.duration // 60}:{song.duration % 60:02d}"
-    embed.add_field(name="Duration", value=duration_str, inline=True)
-    
-    # QUEUE POSITION AND TIME UNTIL
-    if queue:
-        embed.add_field(name="Position in Queue", value=f"#{len(queue)}", inline=True)
+    embed.add_field(name="Duration", value=fmt_duration(song.duration), inline=True)
+    add_queue_position_fields(embed, player, song)
 
-        # TIME UNTL PLAY
-        time_until = sum(s.duration for s in queue[:-1])
-        if ctx.guild.id in currently_playing and queue:
-            time_until += currently_playing[ctx.guild.id].duration
-            time_until_str = f"{time_until // 60}:{time_until % 60:02d}"
-            embed.add_field(name="Estimated Start", value=time_until_str, inline=True)
-
-    # AUTOPLAY STATUS - TODO ADD MORE INFO ON FAILURES
-    if autoplay_enabled and not from_autoplay:
-        response_text = "✅ Autoplaying from this track" if mb_results else "❌ Failed to identify artist/track"
+    # AUTOPLAY STATUS
+    if show_autoplay_status and not from_autoplay:
+        response_text = "✅ Autoplaying from this track" if meta else "❌ Failed to identify artist/track"
         embed.add_field(name="Autoplay", value=response_text, inline=True)
-    
-    # REQUESTER
+
     embed.set_footer(text=f"Requested by {song.requester}" if not from_autoplay else "Provided by last.fm")
-    
     return embed
 
 
-def create_playlist_embed(playlist_title, song_count, first_song, duration):
+def create_playlist_embed(song_count, first_song, duration, seeds):
     embed = discord.Embed(
         title="Playlist Queued",
-        # description=f"**{playlist_title}**",
         color=discord.Color.green(),
         timestamp=discord.utils.utcnow()
     )
-    
-    # TRACKS ADDED
     embed.add_field(name="Tracks Added", value=f"{song_count} songs", inline=True)
-
-    # DURATION
-    duration_str = f"{duration // 60}:{duration % 60:02d}"
-    embed.add_field(name="Duration", value=duration_str, inline=True)
-    
-    # FIRST TRACK INFO
-    embed.add_field(name="First Track", value=f"[{first_song.title}]({first_song.url})", inline=False)
-
-    # REQUESTER
+    embed.add_field(name="Duration", value=fmt_duration(duration), inline=True)
+    embed.add_field(name="First Track", value=song_link(first_song), inline=False)
+    autoplay_text = f"✅ Autoplaying from {len(seeds)} identified track{'s' if len(seeds) != 1 else ''}" \
+        if seeds else "❌ No songs identified in this playlist"
+    embed.add_field(name="Autoplay", value=autoplay_text, inline=False)
     embed.set_footer(text=f"Requested by {first_song.requester}")
-    
+    return embed
+
+
+def create_album_embed(album, requester):
+    embed = discord.Embed(
+        title="Album Queued",
+        description=f"**{album.title}**\n{album.artist}",
+        color=discord.Color.green(),
+        timestamp=discord.utils.utcnow()
+    )
+    embed.add_field(name="Tracks Added", value=f"{len(album.tracks)} songs", inline=True)
+    embed.add_field(name="Duration", value=fmt_duration(album.duration), inline=True)
+    embed.add_field(name="First Track", value=f"`{album.tracks[0]}`", inline=False)
+    embed.add_field(name="Autoplay", value="✅ Autoplaying similar tracks after the album", inline=False)
+    embed.set_footer(text=f"Requested by {requester}")
     return embed
 
 
@@ -356,28 +208,29 @@ async def on_ready():
     print(f'{bot.user} has connected to Discord!')
 
 
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, (commands.CheckFailure, commands.CommandNotFound)):
+        return  # the check already replied / not one of ours
+    if isinstance(error, commands.UserInputError):
+        usage = f"/{ctx.command.qualified_name} {ctx.command.signature}".strip()
+        await ctx.send(embed=create_embed("Invalid Command", f"Usage: `{usage}`", discord.Color.red()))
+        return
+    print(f"[command error] {ctx.command}: {error!r}")
+    await ctx.send(embed=create_embed("Error", "Something went wrong running that command.", discord.Color.red()))
+
+
 ### COMMANDS ###
 @bot.command()
 async def ping(ctx):
     await ctx.send('Pong!')
 
 
-# TODO SEND EMBED INSTEAD OF MESSAGE?
 @bot.command()
 @in_voice_channel()
 async def disconnect(ctx):
     if ctx.voice_client:
-        if ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
-        
-        queue = get_queue(ctx.guild.id)
-        queue.clear()
-        autoplay_queue = get_autoplay_queue(ctx.guild.id)
-        autoplay_queue.clear()
-        
-        if ctx.guild.id in currently_playing:
-            currently_playing[ctx.guild.id] = None
-        
+        await get_player(ctx).stop()
         await ctx.voice_client.disconnect()
         await ctx.send("DISCONNECTING! LATER DOOOOOOOOG!")
     else:
@@ -387,286 +240,286 @@ async def disconnect(ctx):
 @bot.command()
 @in_voice_channel()
 async def play(ctx, *, search):
-    # CONNECT TO VOICE    
-    voice_channel = ctx.author.voice.channel
-    if not ctx.voice_client:
-        await voice_channel.connect(self_deaf=True)
-    elif ctx.voice_client.channel != voice_channel:
-        await ctx.voice_client.move_to(voice_channel)
-
-    # GUARD: Connection may have failed after retries (e.g. DAVE protocol rejection)
-    if not ctx.voice_client:
-        await ctx.send(embed=create_embed("Error", "Failed to connect to voice channel.", discord.Color.red()))
+    if not await connect_to_voice(ctx):
         return
+    player = get_player(ctx)
 
-    queue = get_queue(ctx.guild.id)
+    if youtube.is_url(search):
+        await play_link(ctx, player, search)
+    else:
+        await play_search(ctx, player, search)
 
-    # QUERY MUSICBRAINZ TO GET METADATA
-    mb_results = None
-    if not ('youtube.com' in search or 'youtu.be' in search):
-        mb_results = await mb_client.song_search_async(search)
-        # UPDATE SEARCH WITH ACCURATE ARTIST AND TITLE
-        if mb_results:
-            search = f'{mb_results['artist']} - {mb_results['track']}'
 
-    # QUERY YOUTUBE
-    yt_results = await query_youtube(search)
-    if not yt_results:
+async def find_song(search):
+    """Turn typed text into a Song. Returns (song, meta); song is None if nothing was found.
+
+    Identify the song first, then find the right upload of it. If the text
+    alone is not enough (no artist, typos), search YouTube with the words as
+    typed and identify the song from the video that comes back.
+    """
+    yt = services.youtube
+    meta = await services.identifier.identify_track(search)
+    try:
+        candidates = await yt.search(f"{meta.artist} - {meta.title}" if meta else search)
+    except Exception as e:
+        print(f"Error querying YouTube: {e!r}")
+        candidates = []
+    best = youtube.pick_best(candidates, meta=meta, query=search)
+    if not best and candidates:
+        best = candidates[0]
+    if not best:
+        return None, None
+
+    song = Song.from_candidate(best, meta)
+
+    # NOT IDENTIFIED FROM THE TEXT - TRY AGAIN FROM THE VIDEO WE LANDED ON
+    if not meta:
+        try:
+            info = await yt.resolve(song)
+            meta = song.meta = await services.identifier.identify_video(info)
+        except Exception as e:
+            print(f"Could not identify from video: {e!r}")
+    return song, meta
+
+
+async def play_search(ctx, player, search):
+    song, meta = await find_song(search)
+    if not song:
         await ctx.send(embed=create_embed("Error", "No song found for that request!", discord.Color.red()))
         return
-    
+    song.requester = ctx.author.name
+    await queue_single(ctx, player, song, meta)
+
+
+async def play_link(ctx, player, url):
+    """/play <url>: a single video or a playlist."""
+    try:
+        kind, info = await services.youtube.fetch_url(url)
+    except Exception as e:
+        print(f"Error querying YouTube: {e!r}")
+        await ctx.send(embed=create_embed("Error", "No song found for that request!", discord.Color.red()))
+        return
+
+    # SINGLE VIDEO
+    if kind == "video":
+        song = Song.from_info(info)
+        song.requester = ctx.author.name
+        meta = song.meta = await services.identifier.identify_video(info)
+        await queue_single(ctx, player, song, meta)
+        return
+
     # PLAYLIST
-    if len(yt_results) > 1:
-        first_song = None
-        songs_added = 0
-        total_duration = 0
+    entries = info.get("entries") or []
+    if not entries:
+        await ctx.send(embed=create_embed("Error", "No song found for that request!", discord.Color.red()))
+        return
+    songs = []
+    for entry in entries:
+        song = Song.from_candidate(youtube.Candidate.from_entry(entry))
+        song.requester = ctx.author.name
+        songs.append(song)
+    player.queue.extend(songs)
 
-        # ADD SONGS
-        for song in yt_results:
-            song.requester = ctx.author.name # Don't love setting this here but makes logic simpler and not require passing ctx around
-            songs_added += 1
-            total_duration += song.duration
-            if not first_song:
-                first_song = song
-            queue.append(song)
+    # START PLAYBACK WHILE WE WORK OUT WHAT THE PLAYLIST CONTAINS
+    _, seeds = await asyncio.gather(player.ensure_playing(), find_playlist_seeds(entries, songs))
+    total_duration = sum(s.duration or 0 for s in songs)
+    await ctx.send(embed=create_playlist_embed(len(songs), songs[0], total_duration, seeds))
+    player.set_seeds(seeds)
 
-        # SEND EMBED - TODO FIGURE OUT A WAY TO CLEANLY PASS THE TITLE
-        await ctx.send(embed=create_playlist_embed("PLAYLIST TITLE PLACEHOLDER", songs_added, first_song, total_duration))
 
-        # PLAY SONG IF NOTHING PLAYING
-        if not ctx.voice_client.is_playing() and queue:
-            song = queue.pop(0)
-            await play_song(ctx, song)
+async def queue_single(ctx, player, song, meta):
+    player.queue.append(song)
+    await player.ensure_playing()
+    await ctx.send(embed=create_song_embed(player, song, meta, show_autoplay_status=True))
 
-    # SINGLE SONG
-    else:
-        song = yt_results[0]
-        song.requester = ctx.author.name # Don't love setting this here but makes logic simpler and not require passing ctx around
+    # AUTOPLAY - rebuilt in the background from this track
+    if meta:
+        player.set_seeds([meta])
 
-        # PLAY SONG / ADD TO QUEUE
-        if not ctx.voice_client.is_playing():
-            await play_song(ctx, song)
-        else:
-            queue.append(song)
 
-        # SEND EMBED
-        await ctx.send(embed=create_song_embed(ctx, song, mb_results))
-    
-        # AUTOPLAY
-        if mb_results and is_autoplay_enabled(ctx.guild.id):
-            # GRAB RECS FROM LAST FM
-            success = await fetch_autoplay_recommendations(ctx, mb_results['mbid'], mb_results['artist'], mb_results['track'])
-            if success:
+@bot.command()
+@in_voice_channel()
+async def album(ctx, *, search):
+    if not await connect_to_voice(ctx):
+        return
+    player = get_player(ctx)
 
-                # CLEAR CURRENT AUTOPLAY QUEUE
-                autoplay_queue = get_autoplay_queue(ctx.guild.id)
-                autoplay_queue.clear()
-                
-                # LOAD TWO AUTOPLAY SONGS TO START - KEEPS BUFFER
-                for _ in range(2):
-                    await load_next_autoplay_song(ctx)
-                
-                print(f"Queued initial autoplay songs")
+    album_meta = await services.identifier.identify_album(search)
+    if not album_meta:
+        await ctx.send(embed=create_embed("Error", "No album found for that request!", discord.Color.red()))
+        return
+
+    # QUEUE EVERY TRACK - each one is matched to YouTube right before it plays
+    songs = []
+    for track in album_meta.tracks:
+        song = Song.from_meta(track)
+        song.requester = ctx.author.name
+        songs.append(song)
+    player.queue.extend(songs)
+
+    await player.ensure_playing()
+    await ctx.send(embed=create_album_embed(album_meta, ctx.author.name))
+
+    # AUTOPLAY - similar tracks to a spread of the album, once it ends
+    player.set_seeds(random.sample(album_meta.tracks, min(MAX_SEEDS, len(album_meta.tracks))))
 
 
 @bot.command()
 @in_voice_channel()
 async def skip(ctx):
-    if not ctx.voice_client or not ctx.voice_client.is_playing():
+    player = get_player(ctx)
+    current = player.current
+    if not ctx.voice_client or not ctx.voice_client.is_playing() or not current:
         await ctx.send("Nothing is playing!")
         return
-    
-    
-    current = currently_playing.get(ctx.guild.id) # Cache current song to reference in embed
-    queue = get_queue(ctx.guild.id)
-    autoplay_queue = get_autoplay_queue(ctx.guild.id)  # AUTOPLAY: Get autoplay queue
-    autoplay_recs = get_autoplay_recommendations(ctx.guild.id)  # AUTOPLAY: Get recommendations
-    
+
     # BUILD EMBED
-    embed = create_embed("Track Skipped", f"~~[{current.title}]({current.url})~~")
-    
-    # SHOW NEXT IN QUEUE
-    if queue:
-        next_song = queue[0]
-        embed.add_field(
-            name="Up Next", 
-            value=f"[{next_song.title}]({next_song.url})",
-            inline=False
-        )
-    # SHOW NEXT IN AUTOPLAY QUEUE - TODO THIS TECHNICALLY WILL SHOW THE NEXT SONG TWICE, HERE AND VIA CALLBACK
-    elif is_autoplay_enabled(ctx.guild.id) and autoplay_queue:
-        next_song = autoplay_queue[0]
-        embed.add_field(
-            name="Up Next (Autoplay)", 
-            value=f"[{next_song.title}]({next_song.url})",
-            inline=False
-        )
+    embed = create_embed("Track Skipped", f"~~{song_link(current)}~~")
+
+    if player.queue:
+        embed.add_field(name="Up Next", value=song_link(player.queue[0]), inline=False)
+    elif player.autoplay_queue:
+        embed.add_field(name="Up Next (Autoplay)", value=song_link(player.autoplay_queue[0]), inline=False)
+        player.suppress_next_announce = True  # this embed already says what's next
     else:
         embed.add_field(name="Up Next", value="Queue is empty", inline=False)
-    
+
     # SKIP SONG VIA CALLBACK
     ctx.voice_client.stop()
-
-    # SEND EMBED
     await ctx.send(embed=embed)
 
 
 @bot.command()
 @in_voice_channel()
 async def queue(ctx):
-    queue = get_queue(ctx.guild.id)
-    autoplay_queue = get_autoplay_queue(ctx.guild.id)
-    autoplay_recs = get_autoplay_recommendations(ctx.guild.id)
-    
-    # ERROR HANDLING
-    if not queue and not autoplay_queue:  # AUTOPLAY: Check both queues
+    player = get_player(ctx)
+    queue, autoplay_queue, autoplay_recs = player.queue, player.autoplay_queue, player.autoplay_recs
+
+    if not queue and not autoplay_queue and not player.current:
         await ctx.send(embed=create_embed("Invalid Command", "The queue is empty", discord.Color.red()))
         return
-    
-    # BUILD QUEUE
+
     queue_text = ""
-    total_duration = 0
 
-    # DISPLAY CURRENTLY PLAYING SONG
-    current = currently_playing.get(ctx.guild.id)
+    # CURRENTLY PLAYING SONG
+    current = player.current
     if current:
-        duration_str = f"{current.duration // 60}:{current.duration % 60:02d}"
-        queue_text += f"**Now Playing**\n[{current.title}]({current.url}) `[{duration_str}]`\n"
+        queue_text += f"**Now Playing**\n{song_link(current)} `[{fmt_duration(current.duration)}]`\n"
 
-    
     # QUEUE
     if queue:
         queue_text += "\n**__Queue__**\n"
-    for i, song in enumerate(queue, 1):
-        duration_str = f"{song.duration // 60}:{song.duration % 60:02d}"
-        queue_text += f"**{i}.** [{song.title}]({song.url}) `[{duration_str}]`\n"
-        total_duration += song.duration
+    for i, song in enumerate(queue[:QUEUE_DISPLAY_LIMIT], 1):
+        queue_text += f"**{i}.** {song_link(song)} `[{fmt_duration(song.duration)}]`\n"
+    if len(queue) > QUEUE_DISPLAY_LIMIT:
+        queue_text += f"*...and {len(queue) - QUEUE_DISPLAY_LIMIT} more*\n"
+    total_duration = sum(s.duration or 0 for s in queue)
 
-    total_str = f"{total_duration // 60}:{total_duration % 60:02d}"
-    
     # AUTOPLAY QUEUE
-    if is_autoplay_enabled(ctx.guild.id) and (autoplay_queue or autoplay_recs):
+    if autoplay_queue or autoplay_recs:
         queue_text += "\n**__Autoplay Queue (Next 5)__**\n"
-        
+
         # SONGS ALREADY RETRIEVED FROM YOUTUBE
         for i, song in enumerate(autoplay_queue[:5], 1):
-            duration_str = f"{song.duration // 60}:{song.duration % 60:02d}"
-            queue_text += f"**A{i}.** [{song.title}]({song.url}) `[{duration_str}]`\n"
-        
+            queue_text += f"**A{i}.** {song_link(song)} `[{fmt_duration(song.duration)}]`\n"
+
         # UPCOMING RECOMMENDATIONS
         remaining_slots = 5 - len(autoplay_queue)
-        if remaining_slots > 0 and autoplay_recs:
+        if remaining_slots > 0:
             for i, rec in enumerate(autoplay_recs[:remaining_slots], len(autoplay_queue) + 1):
-                queue_text += f"**A{i}.** {rec['artist']} - {rec['title']} `[pending]`\n"
-    
+                queue_text += f"**A{i}.** {rec.artist} - {rec.title} `[pending]`\n"
+
     # FOOTER
-    footer_text = f"{len(queue)} songs • Total duration: {total_str}"
-    if is_autoplay_enabled(ctx.guild.id):
-        total_autoplay = len(autoplay_queue) + len(autoplay_recs)
-        if total_autoplay > 0:
-            footer_text += f" • {total_autoplay} autoplay songs available"
-    
-    # SEND EMBED
+    footer_text = f"{len(queue)} songs • Total duration: {fmt_duration(total_duration) if queue else '0:00'}"
+    total_autoplay = len(autoplay_queue) + len(autoplay_recs)
+    if total_autoplay > 0:
+        footer_text += f" • {total_autoplay} autoplay songs available"
+
     await ctx.send(embed=create_embed('Current Queue', queue_text, discord.Color.purple(), footer_text))
 
 
 @bot.command()
 @in_voice_channel()
 async def shuffle(ctx):
-    queue = get_queue(ctx.guild.id)
-    
+    queue = get_player(ctx).queue
+
     # ERROR HANDLING
     error_text = None
     if not queue:
         error_text = "The queue is empty - there is nothing to shuffle"
-
-    if len(queue) < 2:
-        error_text = f"The queue is too small to shuffle",
-    
+    elif len(queue) < 2:
+        error_text = "The queue is too small to shuffle"
 
     if error_text:
         await ctx.send(embed=create_embed("Invalid Command", error_text, discord.Color.red()))
         return
-    
-    # SHUFFLE QUEUE
+
     random.shuffle(queue)
-    
+
     # CREATE PREVIEW
     preview = "\n".join([f"**{i+1}.** {song.title}" for i, song in enumerate(queue[:5])])
     if len(queue) > 5:
         preview += f"\n*...and {len(queue) - 5} more*"
-    
-    # SEND EMBED
+
     await ctx.send(embed=create_embed("Queue Shuffled", preview, discord.Color.blue(), f"Shuffled {len(queue)} songs"))
 
 
 @bot.command()
 @in_voice_channel()
 async def clear(ctx):
-    queue = get_queue(ctx.guild.id)
-    
-    # ERROR HANDLING
+    queue = get_player(ctx).queue
+
     if not queue:
         await ctx.send(embed=create_embed("Invalid Command", "The queue is empty - there is nothing to clear", discord.Color.red()))
         return
-    
-    # CLEAR QUEUE
+
     song_count = len(queue)
     queue.clear()
-    
-    # SEND EMBED
+
     await ctx.send(embed=create_embed("Queue Cleared", f"Removed {song_count} song{'s' if song_count != 1 else ''} from the queue"))
 
 
 @bot.command()
 @in_voice_channel()
 async def remove(ctx, position: int):
-    queue = get_queue(ctx.guild.id)
-    
+    queue = get_player(ctx).queue
+
     # ERROR HANDLING
     error_text = None
     if not queue:
-        error_text = "The queue is empty - there is nothing to bump"
-
-    if position < 1 or position > len(queue):
-        error_text = f"Please choose a number between 1 and {len(queue)}",
-    
+        error_text = "The queue is empty - there is nothing to remove"
+    elif position < 1 or position > len(queue):
+        error_text = f"Please choose a number between 1 and {len(queue)}"
 
     if error_text:
         await ctx.send(embed=create_embed("Invalid Command", error_text, discord.Color.red()))
         return
-    
-    # REMOVE SONG
+
     removed_song = queue.pop(position - 1)
-    
-    # SEND EMBED
-    await ctx.send(embed=create_embed("Song Removed", f"~~[{removed_song.title}]({removed_song.url})~~", discord.Color.blue(), f"{len(queue)} song{'s' if len(queue) != 1 else ''} remaining in queue"))
+
+    await ctx.send(embed=create_embed("Song Removed", f"~~{song_link(removed_song)}~~", discord.Color.blue(), f"{len(queue)} song{'s' if len(queue) != 1 else ''} remaining in queue"))
 
 
 @bot.command()
 @in_voice_channel()
 async def bump(ctx, position: int):
-    queue = get_queue(ctx.guild.id)
-    
+    queue = get_player(ctx).queue
+
     # ERROR HANDLING
     error_text = None
     if not queue:
         error_text = "The queue is empty - there is nothing to bump"
-
-    if position < 2 or position > len(queue):
-        error_text = f"Please choose a number between 2 and {len(queue)}",
-    
+    elif position < 2 or position > len(queue):
+        error_text = f"Please choose a number between 2 and {len(queue)}"
 
     if error_text:
         await ctx.send(embed=create_embed("Invalid Command", error_text, discord.Color.red()))
         return
 
-    # BUMP SONG
     bumped_song = queue.pop(position - 1)
     queue.insert(0, bumped_song)
-    
-    # SEND EMBED
-    await ctx.send(embed=create_embed("Song Bumped to Top", f"[{bumped_song.title}]({bumped_song.url})"))
+
+    await ctx.send(embed=create_embed("Song Bumped to Top", song_link(bumped_song)))
 
 
 @bot.command()
@@ -678,63 +531,21 @@ async def autoplay(ctx):
 @bot.command()
 async def help(ctx):
     embed = create_embed("BIG CHINA Command List", "Available commands:", color=discord.Color.gold())
-    
-    # embed.add_field(
-    #     name="/autoplay",
-    #     value="Toggle autoplay on/off. If enabled, /played tracks able to be identified will create an autoplay queue to continue playing when the main queue is empty",
-    #     inline=False
-    # )
 
-    embed.add_field(
-        name="/bump <position>",
-        value="Move a song to the top of the queue",
-        inline=False
-    )
+    embed.add_field(name="/album <album name>", value="Queue a full album, then autoplay similar tracks", inline=False)
+    embed.add_field(name="/bump <position>", value="Move a song to the top of the queue", inline=False)
+    embed.add_field(name="/clear", value="Clear the entire queue", inline=False)
+    embed.add_field(name="/disconnect", value="Disconnect bot from voice channel", inline=False)
+    embed.add_field(name="/play <song/url>", value="Play a song, video or playlist, or add it to queue", inline=False)
+    embed.add_field(name="/queue", value="Show the current queue and autoplay queue", inline=False)
+    embed.add_field(name="/remove <position>", value="Remove a song at the specified position", inline=False)
+    embed.add_field(name="/shuffle", value="Shuffle the queue", inline=False)
+    embed.add_field(name="/skip", value="Skip the current song", inline=False)
 
-    embed.add_field(
-        name="/clear",
-        value="Clear the entire queue",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/disconnect",
-        value="Disconnect bot from voice channel",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/play <song/url>",
-        value="Play a song or add it to queue",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/queue",
-        value="Show the current queue and autoplay queue (if enabled)",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/remove <position>",
-        value="Remove a song at the specified position",
-        inline=False
-    )
-
-    embed.add_field(
-        name="/shuffle",
-        value="Shuffle the queue",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="/skip",
-        value="Skip the current song",
-        inline=False
-    )
-    
     embed.set_footer(text="Use / before each command")
-    
+
     await ctx.send(embed=embed)
 
-bot.run(TOKEN)
+
+if __name__ == "__main__":
+    bot.run(TOKEN)
